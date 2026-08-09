@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use crate::services::agy;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
+use crate::services::omp;
 use crate::services::file_ops::{
     open_directory_for_read, open_regular_file_no_follow, remove_file_by_identity,
     stable_file_identity, stable_path_identity, DirectoryAccess, DirectoryFileOptions,
@@ -17099,19 +17100,23 @@ async fn handle_message(
         } else {
             // /loop uses a self-verification step that currently supports
             // Claude (native --fork-session), Codex (ephemeral exec over the
-            // full-fidelity session archive), and OpenCode (native --fork with
-            // the `plan` agent). Other providers (currently Agy) are rejected.
+            // full-fidelity session archive), OpenCode (native --fork with
+            // the `plan` agent), and Omp. Other providers (currently Agy) are rejected.
             let provider = {
                 let _m = get_model(&state.lock().await.settings, chat_id);
                 detect_provider(_m.as_deref()).to_string()
             };
-            if provider != "claude" && provider != "codex" && provider != "opencode" {
+            if provider != "claude"
+                && provider != "codex"
+                && provider != "opencode"
+                && provider != "omp"
+            {
                 shared_rate_limit_wait(&state, chat_id).await;
                 tg!(
                     "send_message",
                     bot.send_message(
                         chat_id,
-                        "/loop currently supports Claude, Codex, or OpenCode models only."
+                        "/loop currently supports Claude, Codex, OpenCode, or Omp models only."
                     )
                     .await
                 )?;
@@ -17316,7 +17321,7 @@ Ask in natural language to manage schedules.
 
 <b>Settings</b>
 <code>/model</code> — Show current AI model
-<code>/model &lt;name&gt;</code> — Set model (claude/codex/agy/opencode or provider:model)
+<code>/model &lt;name&gt;</code> — Set model (claude/codex/agy/opencode/omp or provider:model)
 <code>/stt_model</code> — Show current speech recognition model
 <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
@@ -17505,21 +17510,31 @@ async fn handle_start_command(
                 SessionProvider::Codex,
                 SessionProvider::Agy,
                 SessionProvider::OpenCode,
+                SessionProvider::Omp,
             ],
             SessionProvider::Codex => &[
                 SessionProvider::Claude,
                 SessionProvider::Agy,
                 SessionProvider::OpenCode,
+                SessionProvider::Omp,
             ],
             SessionProvider::Agy => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::OpenCode,
+                SessionProvider::Omp,
             ],
             SessionProvider::OpenCode => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::Agy,
+                SessionProvider::Omp,
+            ],
+            SessionProvider::Omp => &[
+                SessionProvider::Claude,
+                SessionProvider::Codex,
+                SessionProvider::Agy,
+                SessionProvider::OpenCode,
             ],
         };
 
@@ -17611,6 +17626,7 @@ async fn handle_start_command(
                     SessionProvider::Codex => codex::is_codex_available(),
                     SessionProvider::Agy => agy::is_agy_available(),
                     SessionProvider::OpenCode => opencode::is_opencode_available(),
+                    SessionProvider::Omp => omp::is_omp_available(),
                 };
                 if !available {
                     msg_debug(&format!(
@@ -18096,6 +18112,7 @@ enum SessionProvider {
     Codex,
     Agy,
     OpenCode,
+    Omp,
 }
 
 /// Detect provider from model prefix only (no availability fallback).
@@ -18107,6 +18124,8 @@ fn provider_from_model(model: Option<&str>) -> &'static str {
         "agy"
     } else if opencode::is_opencode_model(model) {
         "opencode"
+    } else if omp::is_omp_model(model) {
+        "omp"
     } else {
         "claude"
     }
@@ -18122,6 +18141,8 @@ fn detect_provider(model: Option<&str>) -> &'static str {
         "agy"
     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
         "opencode"
+    } else if !claude::is_claude_available() && omp::is_omp_available() {
+        "omp"
     } else {
         "claude"
     }
@@ -18147,6 +18168,7 @@ pub fn resolve_session_provider_pub(
             "codex" => providers.push(SessionProvider::Codex),
             "agy" | "gemini" => providers.push(SessionProvider::Agy),
             "opencode" => providers.push(SessionProvider::OpenCode),
+            "omp" => providers.push(SessionProvider::Omp),
             _ => {}
         }
     }
@@ -18156,6 +18178,7 @@ pub fn resolve_session_provider_pub(
         SessionProvider::Codex,
         SessionProvider::Agy,
         SessionProvider::OpenCode,
+        SessionProvider::Omp,
     ] {
         if !providers.contains(&provider) {
             providers.push(provider);
@@ -18177,6 +18200,7 @@ fn provider_to_session(provider: &str) -> SessionProvider {
         "codex" => SessionProvider::Codex,
         "agy" | "gemini" => SessionProvider::Agy,
         "opencode" => SessionProvider::OpenCode,
+        "omp" => SessionProvider::Omp,
         _ => SessionProvider::Claude,
     }
 }
@@ -18188,6 +18212,7 @@ fn session_provider_str(provider: SessionProvider) -> &'static str {
         SessionProvider::Codex => "codex",
         SessionProvider::Agy => "agy",
         SessionProvider::OpenCode => "opencode",
+        SessionProvider::Omp => "omp",
     }
 }
 
@@ -18218,6 +18243,7 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
         SessionProvider::Codex => resolve_codex_by_id(query),
         SessionProvider::Agy => resolve_agy_by_id(query),
         SessionProvider::OpenCode => resolve_opencode_by_id(query),
+        SessionProvider::Omp => resolve_omp_by_id(query),
     };
     msg_debug(&format!(
         "[resolve_session] result={}",
@@ -18381,6 +18407,60 @@ fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
         session_id: session_id.to_string(),
         provider: SessionProvider::Codex,
     })
+}
+
+/// Omp: scan `~/.omp/agent/sessions/*/*.jsonl` for a matching session ID.
+fn resolve_omp_by_id(session_id: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[resolve_omp_by_id] session_id={}", session_id));
+    let sessions_dir = dirs::home_dir()?
+        .join(".omp")
+        .join("agent")
+        .join("sessions");
+    if !sessions_dir.is_dir() {
+        msg_debug(&format!(
+            "[resolve_omp_by_id] sessions_dir not found: {}",
+            sessions_dir.display()
+        ));
+        return None;
+    }
+
+    for cwd_entry in fs::read_dir(&sessions_dir).ok()?.flatten() {
+        if !cwd_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
+        let Ok(file_entries) = fs::read_dir(cwd_entry.path()) else {
+            continue;
+        };
+        for file_entry in file_entries.flatten() {
+            let path = file_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let stem_matches = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map_or(false, |stem| stem.ends_with(session_id));
+            let Some((header_id, cwd)) = omp::parse_omp_session_header(&path) else {
+                continue;
+            };
+            if stem_matches || header_id == session_id {
+                msg_debug(&format!(
+                    "[resolve_omp_by_id] found: cwd={:?}, file={}, session_id={}",
+                    cwd,
+                    path.display(),
+                    header_id
+                ));
+                return Some(ResolvedSession {
+                    cwd,
+                    jsonl_path: path,
+                    session_id: header_id,
+                    provider: SessionProvider::Omp,
+                });
+            }
+        }
+    }
+    msg_debug("[resolve_omp_by_id] no matching session found");
+    None
 }
 
 /// Agy: resolve `~/.gemini/antigravity-cli/conversations/<id>.db|.pb`.
@@ -18596,6 +18676,7 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
         SessionProvider::Codex => parse_codex_jsonl,
         SessionProvider::Agy => parse_agy_session,
         SessionProvider::OpenCode => parse_opencode_session,
+        SessionProvider::Omp => parse_omp_jsonl,
     };
     msg_debug(&format!(
         "[convert_session] parsing with provider={:?}",
@@ -18822,6 +18903,7 @@ fn find_latest_session_by_cwd(
         SessionProvider::Codex => find_latest_codex_by_cwd(canonical_path),
         SessionProvider::Agy => find_latest_agy_by_cwd(canonical_path),
         SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
+        SessionProvider::Omp => find_latest_omp_by_cwd(canonical_path),
     };
     msg_debug(&format!(
         "[find_latest_by_cwd] result={}",
@@ -18942,6 +19024,67 @@ fn find_latest_codex_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
         jsonl_path,
         session_id,
         provider: SessionProvider::Codex,
+    })
+}
+
+/// Omp: scan `~/.omp/agent/sessions/*/*.jsonl` for the latest session matching cwd.
+fn find_latest_omp_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
+    let sessions_dir = dirs::home_dir()?
+        .join(".omp")
+        .join("agent")
+        .join("sessions");
+    msg_debug(&format!(
+        "[find_latest_omp_by_cwd] sessions_dir={}, canonical_path={:?}",
+        sessions_dir.display(),
+        canonical_path
+    ));
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+
+    let mut best: Option<(PathBuf, String, String)> = None;
+    let mut best_time = std::time::UNIX_EPOCH;
+    for cwd_entry in fs::read_dir(&sessions_dir).ok()?.flatten() {
+        if !cwd_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
+        let Ok(file_entries) = fs::read_dir(cwd_entry.path()) else {
+            continue;
+        };
+        for file_entry in file_entries.flatten() {
+            let path = file_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some((session_id, cwd)) = omp::parse_omp_session_header(&path) else {
+                continue;
+            };
+            if cwd != canonical_path {
+                continue;
+            }
+            let mtime = path
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.is_none() || mtime > best_time {
+                best = Some((path, session_id, cwd));
+                best_time = mtime;
+            }
+        }
+    }
+
+    let (jsonl_path, session_id, cwd) = best?;
+    msg_debug(&format!(
+        "[find_latest_omp_by_cwd] found: session_id={}, file={}",
+        session_id,
+        jsonl_path.display()
+    ));
+    Some(ResolvedSession {
+        cwd,
+        jsonl_path,
+        session_id,
+        provider: SessionProvider::Omp,
     })
 }
 
@@ -19267,6 +19410,64 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
         current_path: cwd.to_string(),
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         provider: "codex".to_string(),
+    })
+}
+
+/// Parse an Omp CLI JSONL file into cokacdir SessionData.
+fn parse_omp_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(jsonl_path).ok()?;
+    let reader = BufReader::new(file);
+    let mut history: Vec<HistoryItem> = Vec::new();
+
+    for line in reader.lines().flatten() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if val.get("type").and_then(|value| value.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(message) = val.get("message") else {
+            continue;
+        };
+        let Some(role) = message.get("role").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(content) = message.get("content").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(|value| value.as_str()) != Some("text") {
+                continue;
+            }
+            let Some(text) = block.get("text").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let item_type = match role {
+                "user" => HistoryType::User,
+                "assistant" => HistoryType::Assistant,
+                _ => continue,
+            };
+            history.push(HistoryItem {
+                item_type,
+                content: truncate_utf8(text, 300),
+            });
+        }
+    }
+
+    if history.is_empty() {
+        return None;
+    }
+
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "omp".to_string(),
     })
 }
 
@@ -19842,12 +20043,14 @@ async fn handle_session_command(
                 "codex" => format!("codex resume {}", id),
                 "agy" => format!("agy --conversation {}", id),
                 "opencode" => format!("opencode -s {}", id),
+                "omp" => format!("omp -r {}", id),
                 _ => format!("claude --resume {}", id),
             };
             let provider = match session_prov {
                 "codex" => "Codex",
                 "agy" => "Agy",
                 "opencode" => "OpenCode",
+                "omp" => "Omp",
                 _ => "Claude",
             };
             let msg = format!(
@@ -23163,6 +23366,12 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         } else {
             Err("opencode")
         }
+    } else if omp::is_omp_model(Some(clean)) {
+        if omp::is_omp_available() {
+            Ok(clean.to_string())
+        } else {
+            Err("omp")
+        }
     } else {
         Err("") // invalid format
     }
@@ -23401,6 +23610,7 @@ async fn handle_fast_command(
             "claude" => "Claude",
             "agy" => "Agy",
             "opencode" => "OpenCode",
+            "omp" => "Omp",
             _ => provider,
         };
         shared_rate_limit_wait(state, chat_id).await;
@@ -23600,6 +23810,7 @@ async fn handle_model_command(
         let has_codex = codex::is_codex_available();
         let has_agy = agy::is_agy_available();
         let has_opencode = opencode::is_opencode_available();
+        let has_omp = omp::is_omp_available();
 
         let mut msg = match &current {
             Some(m) => format!("Current model: <b>{}</b>\n", m),
@@ -23610,6 +23821,8 @@ async fn handle_model_command(
                     "codex"
                 } else if has_agy {
                     "agy"
+                } else if has_omp {
+                    "omp"
                 } else {
                     "opencode"
                 };
@@ -23661,6 +23874,12 @@ async fn handle_model_command(
             for model_id in opencode::list_models() {
                 msg.push_str(&format!("<code>/model opencode:{}</code>\n", model_id));
             }
+        }
+        if has_omp {
+            msg.push_str("\n<b>Omp (Oh My Pi):</b>\n");
+            msg.push_str(
+                "<code>/model omp</code> — default (uses your ~/.omp config; model shown above)\n",
+            );
         }
 
         if msg.len() <= TELEGRAM_MSG_LIMIT {
@@ -23825,7 +24044,8 @@ async fn handle_model_command(
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
                  <code>/model agy</code> or <code>/model agy:&lt;model&gt;</code>\n\
-                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
+                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>\n\
+                 <code>/model omp</code> or <code>/model omp:&lt;model&gt;</code>"
                 )
                 .parse_mode(ParseMode::Html)
                 .await
@@ -24966,6 +25186,21 @@ async fn handle_text_message(
                     effort_clone.as_deref(),
                     codex_fast_clone,
                 )
+            } else if provider == "omp" {
+                let omp_model = model_clone.as_deref().and_then(omp::strip_omp_prefix);
+                msg_debug(&format!(
+                    "[handle_text_message] → omp::execute, omp_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    omp_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()
+                ));
+                omp::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(cancel_token_clone),
+                    omp_model,
+                )
             } else {
                 let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
                 msg_debug(&format!(
@@ -25991,7 +26226,8 @@ async fn handle_text_message(
                     && !cancel_token.cancelled.load(Ordering::Relaxed)
                     && (provider_str == "claude"
                         || provider_str == "codex"
-                        || provider_str == "opencode")
+                        || provider_str == "opencode"
+                        || provider_str == "omp")
                 {
                     let loop_info = {
                         let data = state_owned.lock().await;
@@ -26181,6 +26417,11 @@ async fn handle_text_message(
                                         ),
                                         "opencode" => {
                                             crate::services::opencode::verify_completion_opencode(
+                                                &sid_clone, &cwd_clone,
+                                            )
+                                        }
+                                        "omp" => {
+                                            crate::services::omp::verify_completion_omp(
                                                 &sid_clone, &cwd_clone,
                                             )
                                         }
@@ -30893,6 +31134,21 @@ async fn execute_schedule(
                 effort_for_exec.as_deref(),
                 codex_fast_for_exec,
             )
+        } else if provider == "omp" {
+            let omp_model = model_clone_for_exec
+                .as_deref()
+                .and_then(omp::strip_omp_prefix);
+            sched_debug(&format!("[execute_schedule] → omp::execute, omp_model={:?}, session_id={:?}, working_dir={}, prompt_len={}, system_prompt_len={}",
+                omp_model, resume_ref, working_dir_for_exec, prompt.len(), system_prompt_owned.len()));
+            omp::execute_command_streaming(
+                &prompt,
+                resume_ref,
+                &working_dir_for_exec,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(cancel_token_clone),
+                omp_model,
+            )
         } else {
             let claude_model = model_clone_for_exec
                 .as_deref()
@@ -32439,6 +32695,19 @@ async fn process_bot_message(
                 effort_clone.as_deref(),
                 codex_fast_clone,
             )
+        } else if provider == "omp" {
+            let omp_model = model_clone.as_deref().and_then(omp::strip_omp_prefix);
+            msg_debug(&format!("[process_bot_message] → omp::execute, omp_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                omp_model, session_id_clone, current_path_clone, prompt_for_ai.len(), system_prompt_owned.len()));
+            omp::execute_command_streaming(
+                &prompt_for_ai,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(cancel_token_clone),
+                omp_model,
+            )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
             claude::execute_command_streaming(
@@ -33975,7 +34244,7 @@ async fn execute_companion_ping(
     let model_clone = run.model.clone();
     let cancel_token_clone = cancel_token.clone();
     // This explicit tool set is enforced only by the Claude branch below.
-    // Codex, Agy, and OpenCode companion agents keep their native/full access.
+    // Codex, Agy, OpenCode, and Omp companion agents keep their native/full access.
     let allowed_tools: Vec<String> = ["Read", "Glob", "Grep", "WebSearch"]
         .iter()
         .map(|tool| tool.to_string())
@@ -34042,6 +34311,17 @@ async fn execute_companion_ping(
                 Some(&codex_auto_send),
                 effort_clone.as_deref(),
                 codex_fast_clone,
+            )
+        } else if provider == "omp" {
+            let omp_model = model_clone.as_deref().and_then(omp::strip_omp_prefix);
+            omp::execute_command_streaming(
+                &prompt,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(cancel_token_clone),
+                omp_model,
             )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);

@@ -7,6 +7,7 @@ pub mod file_ops;
 pub mod memory;
 pub mod messenger_bridge;
 pub mod opencode;
+pub mod omp;
 pub mod process;
 pub mod remote;
 pub mod remote_transfer;
